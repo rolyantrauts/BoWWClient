@@ -8,6 +8,7 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <deque>
 #include <getopt.h>
 #include <alsa/asoundlib.h>
 
@@ -29,7 +30,7 @@ void print_usage(const char* prog_name) {
               << "  -d <device>    ALSA capture device (default: plughw:Loopback,1,0)\n"
               << "  -f <filepath>  Read from a 16kHz 16-bit Mono .wav file instead of ALSA\n"
               << "  -m <filepath>  Path to the trained .tflite model file\n"
-              << "  -t <float>     Detection confidence threshold from 0.0 to 1.0 (default: 0.85)\n"
+              << "  -t <float>     Detection envelope threshold from 0.0 to 1.0 (default: 0.60)\n"
               << "  -D             Enable Debug Mode (outputs live VU meter and inference scores)\n"
               << "  -h             Show this help message and exit\n\n";
 }
@@ -62,41 +63,123 @@ std::vector<std::string> load_labels(const std::string& model_path) {
 }
 
 // ==============================================================================
-// 2. DC-Blocking High-Pass Filter (1st-Order IIR)
-// Removes DC offset (0Hz) and attenuates low-frequency rumble (e.g., 50Hz hum)
+// 2. Lookahead AGC (Automatic Gain Control)
 // ==============================================================================
-class HighPassFilter {
+class LookaheadAGC {
 private:
-    float alpha_;
-    float prev_x_;
-    float prev_y_;
+    std::deque<std::vector<float>> delay_line_;
+    float current_gain_;
+    float target_peak_;
+    float max_gain_;
+    float attack_coeff_;
+    float release_coeff_;
 
 public:
-    HighPassFilter(float cutoff_freq = 50.0f, float sample_rate = 16000.0f) {
-        // Calculate the RC filter coefficient
-        float dt = 1.0f / sample_rate;
-        float rc = 1.0f / (2.0f * M_PI * cutoff_freq);
-        alpha_ = rc / (rc + dt);
+    LookaheadAGC(int lookahead_chunks = 5,      // 5 chunks * 20ms = 100ms lookahead
+                 float target_peak = 0.80f,     // The sweet spot for training
+                 float max_gain = 15.0f,        // Maximum amplification for quiet rooms
+                 float attack_sec = 0.05f,      // Fast drop to prevent clipping
+                 float release_sec = 1.5f,      // Slow rise to bridge syllables
+                 float sample_rate = 16000.0f)
+        : current_gain_(1.0f), target_peak_(target_peak), max_gain_(max_gain) {
         
-        prev_x_ = 0.0f;
-        prev_y_ = 0.0f;
+        // Pre-fill the delay line with silence so we can output immediately
+        for (int i = 0; i < lookahead_chunks; ++i) {
+            delay_line_.push_back(std::vector<float>(320, 0.0f));
+        }
+
+        // Calculate single-pole IIR smoothing coefficients
+        attack_coeff_ = std::exp(-1.0f / (attack_sec * sample_rate));
+        release_coeff_ = std::exp(-1.0f / (release_sec * sample_rate));
     }
 
-    void process(float* audio, int length) {
-        for (int i = 0; i < length; ++i) {
-            float x = audio[i];
-            // Difference equation for a 1st-order High Pass Filter
-            float y = alpha_ * (prev_y_ + x - prev_x_);
-            
-            audio[i] = y;
-            prev_x_ = x;
-            prev_y_ = y;
+    void process(const std::vector<float>& in_chunk, std::vector<float>& out_chunk) {
+        delay_line_.push_back(in_chunk);
+
+        // 1. Find absolute max peak in the future 100ms window
+        float max_peak = 0.0001f; // Prevent divide by zero
+        for (const auto& chunk : delay_line_) {
+            for (float val : chunk) {
+                float abs_val = std::abs(val);
+                if (abs_val > max_peak) max_peak = abs_val;
+            }
         }
+
+        // 2. Calculate the raw target multiplier
+        float target_gain = target_peak_ / max_peak;
+        if (target_gain > max_gain_) {
+            target_gain = max_gain_;
+        }
+
+        // 3. Grab the oldest chunk from the delay line
+        out_chunk = delay_line_.front();
+        delay_line_.pop_front();
+
+        // 4. Apply sample-by-sample asymmetric smoothing
+        for (size_t i = 0; i < out_chunk.size(); ++i) {
+            if (target_gain < current_gain_) {
+                // Fast Attack (sound got loud, drop gain quickly)
+                current_gain_ = attack_coeff_ * current_gain_ + (1.0f - attack_coeff_) * target_gain;
+            } else {
+                // Slow Release (sound got quiet, raise gain slowly)
+                current_gain_ = release_coeff_ * current_gain_ + (1.0f - release_coeff_) * target_gain;
+            }
+            
+            out_chunk[i] *= current_gain_;
+            
+            // Hard soft-clip safety net
+            if (out_chunk[i] > 1.0f) out_chunk[i] = 1.0f;
+            if (out_chunk[i] < -1.0f) out_chunk[i] = -1.0f;
+        }
+    }
+    
+    float get_current_gain() const { return current_gain_; }
+};
+
+// ==============================================================================
+// 3. Sliding Window Averager (O(1) Ring Buffer)
+// ==============================================================================
+class WindowAverager {
+private:
+    std::vector<float> window_;
+    int head_;
+    float current_sum_;
+    int cooldown_timer_;
+    int max_cooldown_;
+    float threshold_;
+
+public:
+    WindowAverager(int window_size_frames, float threshold, int cooldown_frames)
+        : window_(window_size_frames, 0.0f), head_(0), current_sum_(0.0f),
+          cooldown_timer_(0), max_cooldown_(cooldown_frames), threshold_(threshold) {}
+
+    bool process(float new_prob, float& out_smoothed_prob) {
+        if (cooldown_timer_ > 0) {
+            cooldown_timer_--;
+        }
+
+        current_sum_ -= window_[head_];
+        window_[head_] = new_prob;
+        current_sum_ += new_prob;
+        head_ = (head_ + 1) % window_.size();
+
+        out_smoothed_prob = current_sum_ / static_cast<float>(window_.size());
+
+        if (cooldown_timer_ == 0 && out_smoothed_prob >= threshold_) {
+            cooldown_timer_ = max_cooldown_; 
+            return true;
+        }
+        return false;
+    }
+
+    void reset() {
+        std::fill(window_.begin(), window_.end(), 0.0f);
+        current_sum_ = 0.0f;
     }
 };
 
 // ==============================================================================
-// 3. ALSA Hardware Initialization
+// 4. ALSA Hardware Initialization
 // ==============================================================================
 snd_pcm_t* init_alsa_mono(const std::string& device, int rate, snd_pcm_uframes_t period) {
     snd_pcm_t* handle;
@@ -124,7 +207,7 @@ snd_pcm_t* init_alsa_mono(const std::string& device, int rate, snd_pcm_uframes_t
 }
 
 // ==============================================================================
-// 4. Main WakeWord Loop 
+// 5. Main WakeWord Loop 
 // ==============================================================================
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
@@ -133,7 +216,7 @@ int main(int argc, char* argv[]) {
     std::string alsa_dev = "plughw:Loopback,1,0";
     std::string model_file = "models/wakeword.tflite";
     std::string file_input = "";
-    float threshold = 0.85f;
+    float threshold = 0.60f; 
     bool debug_mode = false;
 
     int opt;
@@ -158,14 +241,18 @@ int main(int argc, char* argv[]) {
     const int TF_FRAME_LENGTH = 640;   
     const int TF_MFCC_BINS = 20;       
 
-    std::cout << "\n[OK] BoWWClient Online (HPF + Multi-Class Mode).\n";
+    // --- TUNING PARAMETERS ---
+    LookaheadAGC agc(5, 0.80f, 15.0f, 0.05f, 1.5f, SAMPLE_RATE);
+    WindowAverager jarvis_averager(30, threshold, 40); // 600ms envelope, 800ms cooldown
+
+    std::cout << "\n[OK] BoWWClient Online (Lookahead AGC + Envelope Mode).\n";
     if (file_input.empty()) {
         std::cout << "     ALSA Device: " << alsa_dev << "\n";
     } else {
         std::cout << "     File Input:  " << file_input << " (Simulated Real-Time)\n";
     }
     std::cout << "     Model File:  " << model_file << "\n";
-    std::cout << "     Threshold:   " << threshold << "\n";
+    std::cout << "     Avg Threshold: " << threshold << " (over 600ms)\n";
     std::cout << "     Debug Mode:  " << (debug_mode ? "ON" : "OFF") << "\n\n";
 
     std::vector<std::string> class_labels = load_labels(model_file);
@@ -183,17 +270,16 @@ int main(int argc, char* argv[]) {
             std::cerr << "[!] FATAL: Could not open file: " << file_input << "\n";
             return 1;
         }
-        // Skip the standard 44-byte WAV header
         wav_file.seekg(44, std::ios::beg); 
     }
 
-    // Initialize the 50Hz High-Pass Filter
-    HighPassFilter hpf(50.0f, SAMPLE_RATE);
     FeatureExtractor feature_extractor;
 
     std::vector<int16_t> audio_buf(HOP_STEP);
     std::vector<float> hop_float(HOP_STEP);
+    std::vector<float> agc_float(HOP_STEP);
     std::vector<float> sliding_audio_window(TF_FRAME_LENGTH, 0.0f); 
+    std::vector<float> clean_buffer(TF_FRAME_LENGTH, 0.0f);
     std::vector<float> current_mfccs(TF_MFCC_BINS, 0.0f);
 
     std::cout << "\n[OK] Processing Audio...\n\n";
@@ -205,7 +291,6 @@ int main(int argc, char* argv[]) {
                 std::cout << "\n[OK] Reached end of audio file.\n";
                 break;
             }
-            // Sleep for 20ms to simulate the exact hardware timing of the live microphone
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         } else {
             int frames_read = snd_pcm_readi(mic, audio_buf.data(), HOP_STEP);
@@ -215,60 +300,68 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 1. Convert INT16 to Float
+        // 1. Convert INT16 to Float [-1.0, 1.0]
         for (int i = 0; i < HOP_STEP; ++i) {
             hop_float[i] = static_cast<float>(audio_buf[i]) / 32768.0f;
         }
 
-        // 2. Apply continuous 50Hz DC-Blocking High-Pass Filter
-        hpf.process(hop_float.data(), HOP_STEP);
+        // 2. Pass raw audio through the Lookahead AGC delay line
+        agc.process(hop_float, agc_float);
 
-        // 3. Extract VU Peak AFTER filtering out the DC bias
-        float raw_peak = 0.0f;
-        for (int i = 0; i < HOP_STEP; ++i) {
-            if (std::abs(hop_float[i]) > raw_peak) {
-                raw_peak = std::abs(hop_float[i]);
-            }
-        }
-
-        // 4. Push to sliding window
+        // 3. Push normalized, gain-adjusted audio to sliding window
         std::memmove(sliding_audio_window.data(), 
                      sliding_audio_window.data() + HOP_STEP, 
                      (TF_FRAME_LENGTH - HOP_STEP) * sizeof(float));
         std::memcpy(sliding_audio_window.data() + (TF_FRAME_LENGTH - HOP_STEP), 
-                    hop_float.data(), 
+                    agc_float.data(), 
                     HOP_STEP * sizeof(float));
 
+        // 4. Subtract DC offset (Python Parity)
+        float sum = 0.0f;
+        for (int i = 0; i < TF_FRAME_LENGTH; ++i) {
+            sum += sliding_audio_window[i];
+        }
+        float mean = sum / static_cast<float>(TF_FRAME_LENGTH);
+
+        for (int i = 0; i < TF_FRAME_LENGTH; ++i) {
+            clean_buffer[i] = sliding_audio_window[i] - mean;
+        }
+
         // 5. Extract MFCCs from the clean window
-        feature_extractor.compute_mfcc_features(sliding_audio_window, current_mfccs);
+        feature_extractor.compute_mfcc_features(clean_buffer, current_mfccs);
 
         // 6. Stateful Inference
         std::vector<float> scores = wakeword_model.infer(current_mfccs);
         
-        int best_idx = 0;
-        float best_score = scores[0];
-        for (size_t i = 1; i < scores.size(); ++i) {
-            if (scores[i] > best_score) {
-                best_score = scores[i];
-                best_idx = i;
-            }
-        }
+        float raw_jarvis_prob = scores.empty() ? 0.0f : scores[0]; 
+        float smoothed_jarvis_prob = 0.0f;
 
-        std::string best_label = (best_idx < class_labels.size()) ? class_labels[best_idx] : "IDX_" + std::to_string(best_idx);
+        // 7. Process the rolling average envelope
+        bool is_hit = jarvis_averager.process(raw_jarvis_prob, smoothed_jarvis_prob);
 
         if (debug_mode) {
-            int bars = static_cast<int>(raw_peak * 20.0f);
+            int bars = static_cast<int>(smoothed_jarvis_prob * 20.0f);
             if (bars > 20) bars = 20;
             std::string vu(bars, '#');
             std::string empty(20 - bars, '-');
             
-            std::cout << "\r[MIC VU: " << vu << empty << "] | CLASS: " << best_label << " (" << best_score << ")      " << std::flush;
+            // Format gain for display (e.g., "15.0x", " 2.3x")
+            char gain_str[10];
+            snprintf(gain_str, sizeof(gain_str), "%4.1fx", agc.get_current_gain());
+
+            std::cout << "\r[Gain: " << gain_str << "] [Env: " << vu << empty << "] | Raw: " 
+                      << raw_jarvis_prob << " | Avg: " << smoothed_jarvis_prob << "      " << std::flush;
         }
 
-        // Trigger on ANY threshold pass (no cooldown, no wipes)
-        if (best_idx == 0 && best_score >= threshold) {
+        if (is_hit) {
             if (debug_mode) std::cout << "\n"; 
-            std::cout << "[!!!] HIT! Class: " << best_label << " | Score: " << best_score << "\n";
+            std::cout << "\n🔔 WAKE WORD DETECTED! (Smoothed Envelope: " << smoothed_jarvis_prob << ")\n";
+            
+            // WIPE ALL MEMORY to prevent trailing ghost triggers
+            wakeword_model.reset_states();
+            jarvis_averager.reset();
+
+            if (debug_mode) std::cout << "   (Memory wiped. Cooldown initiated for 800ms...)\n\n"; 
         }
     }
 
