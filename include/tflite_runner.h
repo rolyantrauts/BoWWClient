@@ -13,8 +13,11 @@ public:
     TFLiteRunner(const std::string& model_path);
     ~TFLiteRunner();
 
-    // Now returns a vector of probabilities for all output classes
+    // Returns a vector of probabilities for all output classes
     std::vector<float> infer(const std::vector<float>& input_features);
+
+    // Wipes the internal neural network hidden states to prevent ghost triggers
+    void reset_states();
 
 private:
     std::unique_ptr<tflite::FlatBufferModel> model_;
