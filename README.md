@@ -45,3 +45,8 @@ clients:
 ```
 
 
+-d <device>    ALSA KWS Mono Input (default: plughw:Loopback,1,0)
+This is the 16khz 16bit mono audio stream for the KWS
+-A <device>    ALSA Multi-Mic Array Input (Streaming Source)
+If not defined the -d <device> stream will be streamed to the server.
+If defined the wakeword will use -d <device> but stream the -A <device> 
