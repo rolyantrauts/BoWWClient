@@ -14,7 +14,7 @@ Options:
   -s <uri>       Manual Server URI override (e.g., ws://192.168.1.50:9002)
   -p <float>     Pre-roll buffer duration in seconds (default: 3.0)
   -m <filepath>  Path to trained .tflite model file
-  -t <float>     Envelope threshold 0.0 to 1.0 (default: 0.75)
+  -t <string>    KWS Params: Threshold,Decay,WindowSec (default: 0.75,0.1,0.6)
   -D             Enable Debug Mode (Live VU and logs)
   -h             Show this help message and exit
 ```
