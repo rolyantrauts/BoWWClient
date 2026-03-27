@@ -50,4 +50,12 @@ The mics that pick up a wakeword transmit the wakeword threshold and best thresh
 This is the 16khz 16bit mono audio stream for the KWS  
 -A <device>    ALSA Multi-Mic Array Input (Streaming Source)  
 If not defined the -d <device> stream will be streamed to the server.  
-If defined the wakeword will use -d <device> but stream the -A <device>   
+If defined the wakeword will use -d <device> but stream the -A <device>
+
+# Hardware
+Any single mic or channel from 2/4 mic hat boards can be used.
+A recomendation is for the [MAX9814](https://learn.adafruit.com/adafruit-agc-electret-microphone-amplifier-max9814/overview)
+![max9814](https://cdn-learn.adafruit.com/assets/assets/000/014/304/small360/adafruit_products_1713_LRG.jpg?1392325003)
+The preamp and analogue agc of the max9814 helps much with farfield over standard mics and outputs a line voltage less sussceptable to noise for further distance.
+You can use as is, a 1uf film capacitor on the output with block dc noise, having a 3.3v LDO at the mic end of the cable will also reduce noise even further as the Pi5v is not the cleanest.
+The CM108 board type USB soundcards are good, cheap and you know what your getting. 
