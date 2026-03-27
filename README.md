@@ -57,6 +57,7 @@ Any single mic or channel from 2/4 mic hat boards can be used.
 A recomendation is for the [MAX9814](https://learn.adafruit.com/adafruit-agc-electret-microphone-amplifier-max9814/overview)
 ![max9814](https://cdn-learn.adafruit.com/assets/assets/000/014/304/small360/adafruit_products_1713_LRG.jpg?1392325003)  
 The preamp and analogue agc of the max9814 helps much with farfield over standard mics and outputs a line voltage less sussceptable to noise for further distance.  
-You can use as is, a 1uf film capacitor on the output with block dc noise, having a 3.3v LDO at the mic end of the cable will also reduce noise even further as the Pi5v is not the cleanest.  
+You can use as is, a 1uf film capacitor on the output with block dc noise, having a 3.3v LDO at the mic end of the cable will also reduce noise even further as the Pi5v is not the cleanest.
+Short VCC & gain for 40 dB gain leave AR floating.
 The CM108 board type USB soundcards are good, cheap and you know what your getting.  
 Multiple BoWWClient can connect in groups to BoWWServer to create coverage for a room and due to AUC alg best stream is chosen for ASR
