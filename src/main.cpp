@@ -36,6 +36,7 @@ void print_usage(const char* prog_name) {
     std::cout << "\nBoWWClient - Edge Smart Speaker Engine\n"
               << "Usage: " << prog_name << " [OPTIONS]\n\n"
               << "Options:\n"
+              << "  -c <dir>       Path to config dir for client_guid.txt (default: ./)\n"
               << "  -d <device>    ALSA KWS Mono Input (default: plughw:Loopback,1,0)\n"
               << "  -A <device>    ALSA Multi-Mic Array Input (Streaming Source)\n"
               << "  -s <uri>       Manual Server URI override (e.g., ws://192.168.1.50:9002)\n"
@@ -46,40 +47,35 @@ void print_usage(const char* prog_name) {
               << "  -h             Show this help message and exit\n\n";
 }
 
-// ==============================================================================
-// 1. GUID File Management
-// ==============================================================================
-void load_guid() {
-    std::ifstream file("client_guid.txt");
+void load_guid(const std::string& config_dir) {
+    std::string path = config_dir + "client_guid.txt";
+    std::ifstream file(path);
     if (file.is_open()) {
         std::getline(file, g_client_guid);
         g_authenticated = true;
-        std::cout << "[Auth] Loaded existing GUID: " << g_client_guid << "\n";
+        std::cout << "[Auth] Loaded existing GUID: " << g_client_guid << " from " << path << "\n";
     } else {
         std::cout << "[Auth] No GUID found. Device will run in quarantine mode until onboarded.\n";
     }
 }
 
-void save_guid(const std::string& guid) {
-    std::ofstream file("client_guid.txt");
+void save_guid(const std::string& config_dir, const std::string& guid) {
+    std::string path = config_dir + "client_guid.txt";
+    std::ofstream file(path);
     if (file.is_open()) {
         file << guid;
         g_client_guid = guid;
         g_authenticated = true;
-        std::cout << "[Auth] Saved new GUID: " << guid << "\n";
+        std::cout << "[Auth] Saved new GUID: " << guid << " to " << path << "\n";
+    } else {
+        std::cerr << "[!] Error: Could not save GUID to " << path << "\n";
     }
 }
 
-// ==============================================================================
-// 2. Native mDNS Auto-Discovery (IPv4 Forced for Link-Local Safety)
-// ==============================================================================
 std::string discover_server_mdns() {
     std::cout << "[mDNS] Searching local network for BoWWServer (_boww._tcp)...\n";
     FILE* pipe = popen("avahi-browse -rtp _boww._tcp 2>/dev/null", "r");
-    if (!pipe) {
-        std::cerr << "[mDNS] Error: Failed to execute avahi-browse.\n";
-        return "";
-    }
+    if (!pipe) return "";
     
     char buffer[256];
     std::string ws_uri = "";
@@ -108,9 +104,6 @@ std::string discover_server_mdns() {
     return ws_uri;
 }
 
-// ==============================================================================
-// 3. Core DSP Classes (AGC & Averager)
-// ==============================================================================
 class LookaheadAGC {
 private:
     std::deque<std::vector<float>> delay_line_;
@@ -175,22 +168,6 @@ public:
     }
 };
 
-std::vector<std::string> load_labels(const std::string& model_path) {
-    std::string label_path = model_path;
-    size_t ext_pos = label_path.rfind(".tflite");
-    if (ext_pos != std::string::npos) label_path.replace(ext_pos, 7, "_labels.txt");
-    else label_path += "_labels.txt";
-
-    std::vector<std::string> labels;
-    std::ifstream file(label_path);
-    if (file.is_open()) {
-        std::string line;
-        while (std::getline(file, line)) if (!line.empty()) labels.push_back(line);
-        std::cout << "[OK] Loaded " << labels.size() << " labels.\n";
-    }
-    return labels;
-}
-
 snd_pcm_t* init_alsa_mono(const std::string& device, int rate, snd_pcm_uframes_t period) {
     snd_pcm_t* handle;
     if (snd_pcm_open(&handle, device.c_str(), SND_PCM_STREAM_CAPTURE, 0) < 0) return nullptr;
@@ -213,9 +190,6 @@ snd_pcm_t* init_alsa_mono(const std::string& device, int rate, snd_pcm_uframes_t
     return handle;
 }
 
-// ==============================================================================
-// 4. Alternative Array Audio Thread
-// ==============================================================================
 void array_capture_loop(std::string device, int rate, int hop, AudioRingBuffer* buffer, WebSocketClient* ws) {
     snd_pcm_t* mic = init_alsa_mono(device, rate, hop);
     if (!mic) {
@@ -238,13 +212,11 @@ void array_capture_loop(std::string device, int rate, int hop, AudioRingBuffer* 
     snd_pcm_close(mic);
 }
 
-// ==============================================================================
-// 5. Main Engine
-// ==============================================================================
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    std::string config_dir = "./";
     std::string alsa_kws_dev = "plughw:Loopback,1,0";
     std::string alsa_array_dev = "";
     std::string manual_uri = "";
@@ -255,8 +227,15 @@ int main(int argc, char* argv[]) {
     bool debug_mode = false;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:A:s:p:f:t:m:Dh")) != -1) {
+    // --- UPDATED GETOPT TO INCLUDE 'c:' ---
+    while ((opt = getopt(argc, argv, "c:d:A:s:p:f:t:m:Dh")) != -1) {
         switch (opt) {
+            case 'c': 
+                config_dir = optarg; 
+                if (!config_dir.empty() && config_dir.back() != '/' && config_dir.back() != '\\') {
+                    config_dir += "/";
+                }
+                break;
             case 'd': alsa_kws_dev = optarg; break;
             case 'A': alsa_array_dev = optarg; break;
             case 's': manual_uri = optarg; break;
@@ -277,10 +256,9 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[OK] BoWWClient Edge Node Online.\n";
     
-    // 1. Load GUID if it exists
-    load_guid();
+    // --- PASS DYNAMIC CONFIG PATH ---
+    load_guid(config_dir);
     
-    // 2. Setup Network
     WebSocketClient ws_client;
     std::string ws_uri = manual_uri.empty() ? discover_server_mdns() : manual_uri;
     
@@ -291,11 +269,14 @@ int main(int argc, char* argv[]) {
     
     std::cout << "[Network] Connecting to " << ws_uri << "...\n";
     
-    // Network Event Configuration
     ws_client.on_connected = [&]() {
+        std::lock_guard<std::mutex> lock(g_network_mtx);
         if (g_authenticated) {
-            std::lock_guard<std::mutex> lock(g_network_mtx);
+            std::cout << "[Network] Authenticated as " << g_client_guid << "\n";
             ws_client.send_hello(g_client_guid);
+        } else {
+            std::cout << "[Network] Unenrolled. Requesting Temp ID from server...\n";
+            ws_client.send_enroll();
         }
     };
     
@@ -303,10 +284,19 @@ int main(int argc, char* argv[]) {
         std::cerr << "\n[!] Connection to server lost. Shutting down gracefully...\n";
         g_running = false; 
     };
+
+    ws_client.on_temp_id_assigned = [&](std::string temp_id) {
+        std::cout << "\n======================================================\n";
+        std::cout << " [Auth] Server assigned Temp ID: " << temp_id << "\n";
+        std::cout << " [Auth] Ready for Bluetooth App Onboarding...\n";
+        std::cout << "======================================================\n\n";
+    };
     
     ws_client.on_guid_assigned = [&](std::string new_guid) {
         std::cout << "\n[Auth] Received onboarding payload from Server!\n";
-        save_guid(new_guid);
+        
+        // --- PASS DYNAMIC CONFIG PATH ---
+        save_guid(config_dir, new_guid);
         
         std::lock_guard<std::mutex> lock(g_network_mtx);
         ws_client.send_hello(g_client_guid);
@@ -317,14 +307,12 @@ int main(int argc, char* argv[]) {
     WindowAverager jarvis_averager(30, threshold);
 
     ws_client.on_start_command = [&]() {
-        // The client is ALREADY streaming. This is just a UI confirmation.
         if (debug_mode) std::cout << "\n✅ [Server] Threshold won! You have the floor.\n";
     };
 
     ws_client.on_stop_command = [&]() {
-        // We received a stop command (either lost arbitration, or VAD timed out)
         g_current_state = LISTENING;
-        pre_roll_buffer.flush(); // Clear out any old garbage
+        pre_roll_buffer.flush(); 
         wakeword_model.reset_states();
         jarvis_averager.reset();
         if (debug_mode) std::cout << "\n[Server] Stop Command Rx'd. Returning to Listen.\n\n";
@@ -359,10 +347,6 @@ int main(int argc, char* argv[]) {
         int frames_read = snd_pcm_readi(kws_mic, audio_buf.data(), HOP_STEP);
         if (frames_read < 0) { snd_pcm_recover(kws_mic, frames_read, 1); continue; }
 
-        // =========================================================
-        // PATH 1: NETWORK AUDIO (RAW & UNTOUCHED)
-        // Send raw audio so the server VAD hears the true noise floor.
-        // =========================================================
         if (alsa_array_dev.empty()) {
             if (g_current_state == LISTENING) {
                 pre_roll_buffer.push(audio_buf);
@@ -372,10 +356,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // =========================================================
-        // PATH 2: WAKE WORD AUDIO (PROCESSED)
-        // Convert to float, apply AGC, and subtract mean for local inference.
-        // =========================================================
         for (int i = 0; i < HOP_STEP; ++i) hop_float[i] = static_cast<float>(audio_buf[i]) / 32768.0f;
         agc.process(hop_float, agc_float);
 
@@ -387,7 +367,6 @@ int main(int argc, char* argv[]) {
         float mean = sum / static_cast<float>(TF_FRAME_LENGTH);
         for (int i = 0; i < TF_FRAME_LENGTH; ++i) clean_buffer[i] = sliding_audio_window[i] - mean;
 
-        // Skip TF Lite inference if we are already streaming
         if (g_current_state == STREAMING) continue;
 
         feature_extractor.compute_mfcc_features(clean_buffer, current_mfccs);
@@ -408,14 +387,10 @@ int main(int argc, char* argv[]) {
             if (!g_authenticated) {
                 if (debug_mode) std::cout << "\n[!] Wake word hit, but device is not authenticated! Ignoring.\n";
             } else {
-                
-                // CLIENT ARBITRATION BID & IMMEDIATE STREAM
                 if (debug_mode) std::cout << "\n🔔 WAKE WORD DETECTED! Bidding Threshold & Streaming...\n";
                 
                 std::lock_guard<std::mutex> lock(g_network_mtx);
                 ws_client.send_confidence(smoothed_jarvis_prob);
-                
-                // Immediately dump the buffer to support low-RAM microcontrollers
                 ws_client.send_audio(pre_roll_buffer.flush());
                 g_current_state = STREAMING; 
             }

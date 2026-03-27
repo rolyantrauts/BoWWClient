@@ -1,133 +1,95 @@
 #include "WebSocketClient.h"
 #include <iostream>
-#include <chrono>
+
+const std::string MSG_HELLO = "hello";
+const std::string MSG_ENROLL = "enroll";
+const std::string MSG_ASSIGN_TEMP_ID = "assign_temp_id";
+const std::string MSG_ASSIGN_ID = "assign_id";
+const std::string MSG_START = "start";
+const std::string MSG_STOP = "stop";
+const std::string MSG_CONF_REC = "conf_rec";
 
 WebSocketClient::WebSocketClient() {
-    endpoint_.clear_access_channels(websocketpp::log::alevel::all);
-    endpoint_.clear_error_channels(websocketpp::log::elevel::all);
-    endpoint_.init_asio();
+    c.clear_access_channels(websocketpp::log::alevel::all);
+    c.clear_error_channels(websocketpp::log::elevel::all);
+    c.init_asio();
 
-    endpoint_.set_open_handler(bind(&WebSocketClient::on_open, this, std::placeholders::_1));
-    endpoint_.set_close_handler(bind(&WebSocketClient::on_close, this, std::placeholders::_1));
-    endpoint_.set_fail_handler(bind(&WebSocketClient::on_fail, this, std::placeholders::_1));
-    endpoint_.set_message_handler(bind(&WebSocketClient::on_message, this, std::placeholders::_1, std::placeholders::_2));
+    c.set_open_handler([this](websocketpp::connection_hdl h) {
+        hdl = h;
+        connected = true;
+        if (on_connected) on_connected();
+    });
 
-    ping_thread_ = std::thread(&WebSocketClient::ping_loop, this);
-}
+    c.set_close_handler([this](websocketpp::connection_hdl h) {
+        connected = false;
+        if (on_disconnected) on_disconnected();
+    });
 
-WebSocketClient::~WebSocketClient() {
-    running_ = false;
-    disconnect();
-    if (asio_thread_.joinable()) asio_thread_.join();
-    if (ping_thread_.joinable()) ping_thread_.join();
+    c.set_message_handler([this](websocketpp::connection_hdl h, client::message_ptr msg) {
+        if (msg->get_opcode() == websocketpp::frame::opcode::text) {
+            try {
+                auto j = nlohmann::json::parse(msg->get_payload());
+                if (j.contains("type")) {
+                    std::string type = j["type"];
+                    
+                    if (type == MSG_ASSIGN_ID && j.contains("id")) {
+                        if (on_guid_assigned) on_guid_assigned(j["id"]);
+                    } 
+                    else if (type == MSG_ASSIGN_TEMP_ID && j.contains("id")) {
+                        if (on_temp_id_assigned) on_temp_id_assigned(j["id"]);
+                    } 
+                    else if (type == MSG_START) {
+                        if (on_start_command) on_start_command();
+                    } 
+                    else if (type == MSG_STOP) {
+                        if (on_stop_command) on_stop_command();
+                    }
+                }
+            } catch (...) {}
+        }
+    });
 }
 
 bool WebSocketClient::connect(const std::string& uri) {
     websocketpp::lib::error_code ec;
-    ws_client::connection_ptr con = endpoint_.get_connection(uri, ec);
+    client::connection_ptr con = c.get_connection(uri, ec);
+    if (ec) return false;
     
-    if (ec) {
-        std::cerr << "[Network] Initialization error: " << ec.message() << "\n";
-        return false;
-    }
-    
-    connection_failed_ = false;
-    endpoint_.connect(con);
-    
-    // Spin up the ASIO event loop in the background
-    asio_thread_ = std::thread([this]() { endpoint_.run(); });
-    
-    // Block and wait up to 5 seconds for the connection to fully open or fail
-    int timeout_ms = 5000;
-    while (!connected_ && !connection_failed_ && timeout_ms > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        timeout_ms -= 50;
-    }
-
-    if (!connected_) {
-        // If it timed out or explicitly failed, shut down cleanly
-        if (!connection_failed_) disconnect();
-        return false;
-    }
-
+    c.connect(con);
+    std::thread([this]() { c.run(); }).detach();
     return true;
 }
 
-void WebSocketClient::disconnect() {
-    if (connected_) {
+void WebSocketClient::close() {
+    if (connected) {
         websocketpp::lib::error_code ec;
-        endpoint_.close(hdl_, websocketpp::close::status::normal, "Shutting down", ec);
-        connected_ = false;
+        c.close(hdl, websocketpp::close::status::normal, "", ec);
     }
+}
+
+void WebSocketClient::send_text(const std::string& msg) {
+    if (!connected) return;
+    websocketpp::lib::error_code ec;
+    c.send(hdl, msg, websocketpp::frame::opcode::text, ec);
 }
 
 void WebSocketClient::send_hello(const std::string& guid) {
-    if (!connected_) return;
-    nlohmann::json j;
-    j["type"] = "hello";
-    j["guid"] = guid;
-    websocketpp::lib::error_code ec;
-    endpoint_.send(hdl_, j.dump(), websocketpp::frame::opcode::text, ec);
+    nlohmann::json j = { {"type", MSG_HELLO}, {"guid", guid} };
+    send_text(j.dump());
+}
+
+void WebSocketClient::send_enroll() {
+    nlohmann::json j = { {"type", MSG_ENROLL} };
+    send_text(j.dump());
 }
 
 void WebSocketClient::send_confidence(float score) {
-    if (!connected_) return;
-    nlohmann::json j;
-    j["type"] = "confidence";
-    j["value"] = score;
-    websocketpp::lib::error_code ec;
-    endpoint_.send(hdl_, j.dump(), websocketpp::frame::opcode::text, ec);
+    nlohmann::json j = { {"type", MSG_CONF_REC} }; 
+    send_text(j.dump());
 }
 
 void WebSocketClient::send_audio(const std::vector<int16_t>& pcm_data) {
-    if (!connected_ || pcm_data.empty()) return;
+    if (!connected || pcm_data.empty()) return;
     websocketpp::lib::error_code ec;
-    endpoint_.send(hdl_, pcm_data.data(), pcm_data.size() * sizeof(int16_t), websocketpp::frame::opcode::binary, ec);
-}
-
-void WebSocketClient::on_open(websocketpp::connection_hdl hdl) {
-    hdl_ = hdl;
-    connected_ = true;
-    std::cout << "[Network] Connected to Server.\n";
-    if (on_connected) on_connected();
-}
-
-void WebSocketClient::on_close(websocketpp::connection_hdl hdl) {
-    connected_ = false;
-    std::cout << "[Network] Connection closed by Server.\n";
-    if (on_disconnected) on_disconnected();
-}
-
-void WebSocketClient::on_fail(websocketpp::connection_hdl hdl) {
-    connected_ = false;
-    connection_failed_ = true;
-    std::cerr << "[Network] Connection failed.\n";
-    if (on_disconnected) on_disconnected();
-}
-
-void WebSocketClient::on_message(websocketpp::connection_hdl hdl, ws_client::message_ptr msg) {
-    if (msg->get_opcode() != websocketpp::frame::opcode::text) return;
-    try {
-        auto j = nlohmann::json::parse(msg->get_payload());
-        if (j.contains("type")) {
-            std::string msg_type = j["type"];
-            if (msg_type == "start" && on_start_command) on_start_command();
-            else if (msg_type == "stop" && on_stop_command) on_stop_command();
-            else if (msg_type == "assign_id" && on_guid_assigned && j.contains("id")) {
-                on_guid_assigned(j["id"]);
-            }
-        }
-    } catch (...) {}
-}
-
-void WebSocketClient::ping_loop() {
-    while (running_) {
-        for (int i = 0; i < 300 && running_; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        if (running_ && connected_) {
-            websocketpp::lib::error_code ec;
-            endpoint_.ping(hdl_, "", ec);
-        }
-    }
+    c.send(hdl, pcm_data.data(), pcm_data.size() * sizeof(int16_t), websocketpp::frame::opcode::binary, ec);
 }
