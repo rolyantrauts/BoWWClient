@@ -10,6 +10,7 @@
 #include <chrono>
 #include <deque>
 #include <mutex>
+#include <sstream>
 #include <getopt.h>
 #include <alsa/asoundlib.h>
 
@@ -42,7 +43,7 @@ void print_usage(const char* prog_name) {
               << "  -s <uri>       Manual Server URI override (e.g., ws://192.168.1.50:9002)\n"
               << "  -p <float>     Pre-roll buffer duration in seconds (default: 3.0)\n"
               << "  -m <filepath>  Path to trained .tflite model file\n"
-              << "  -t <float>     Envelope threshold 0.0 to 1.0 (default: 0.75)\n"
+              << "  -t <string>    KWS Params: Threshold,Decay,WindowSec (default: 0.75,0.1,0.6)\n"
               << "  -D             Enable Debug Mode (Live VU and logs)\n"
               << "  -h             Show this help message and exit\n\n";
 }
@@ -147,20 +148,20 @@ private:
     std::vector<float> window_;
     int head_;
     float current_sum_;
-    float threshold_;
 
 public:
-    WindowAverager(int size, float threshold) : window_(size, 0.0f), head_(0), current_sum_(0.0f), threshold_(threshold) {}
+    WindowAverager(int size) : window_(size, 0.0f), head_(0), current_sum_(0.0f) {}
 
-    bool process(float new_prob, float& out_smoothed_prob) {
+    void process(float new_prob, float& out_smoothed_prob) {
         current_sum_ -= window_[head_];
         window_[head_] = new_prob;
         current_sum_ += new_prob;
         head_ = (head_ + 1) % window_.size();
 
         out_smoothed_prob = current_sum_ / static_cast<float>(window_.size());
-        return out_smoothed_prob >= threshold_;
     }
+
+    float get_current_sum() const { return current_sum_; }
 
     void reset() {
         std::fill(window_.begin(), window_.end(), 0.0f);
@@ -212,6 +213,8 @@ void array_capture_loop(std::string device, int rate, int hop, AudioRingBuffer* 
     snd_pcm_close(mic);
 }
 
+enum KWS_State { IDLE, ARMED };
+
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
@@ -222,12 +225,16 @@ int main(int argc, char* argv[]) {
     std::string manual_uri = "";
     std::string model_file = "models/wakeword.tflite";
     std::string file_input = "";
-    float threshold = 0.75f;
+    
+    // --- Default KWS Params ---
+    float kws_threshold = 0.75f;
+    float kws_decay = 0.10f;
+    float kws_window_sec = 0.60f;
+    
     float pre_roll_sec = 3.0f;
     bool debug_mode = false;
 
     int opt;
-    // --- UPDATED GETOPT TO INCLUDE 'c:' ---
     while ((opt = getopt(argc, argv, "c:d:A:s:p:f:t:m:Dh")) != -1) {
         switch (opt) {
             case 'c': 
@@ -241,7 +248,16 @@ int main(int argc, char* argv[]) {
             case 's': manual_uri = optarg; break;
             case 'p': pre_roll_sec = std::stof(optarg); break;
             case 'f': file_input = optarg; break;
-            case 't': threshold = std::stof(optarg); break;
+            case 't': {
+                // Parse the "0.75,0.1,0.6" array
+                std::string arg(optarg);
+                std::stringstream ss(arg);
+                std::string token;
+                if (std::getline(ss, token, ',')) kws_threshold = std::stof(token);
+                if (std::getline(ss, token, ',')) kws_decay = std::stof(token);
+                if (std::getline(ss, token, ',')) kws_window_sec = std::stof(token);
+                break;
+            }
             case 'm': model_file = optarg; break;
             case 'D': debug_mode = true; break;
             case 'h': print_usage(argv[0]); return 0;
@@ -255,8 +271,10 @@ int main(int argc, char* argv[]) {
     const int TF_MFCC_BINS = 20;       
 
     std::cout << "\n[OK] BoWWClient Edge Node Online.\n";
-    
-    // --- PASS DYNAMIC CONFIG PATH ---
+    std::cout << "[KWS] Params -> Threshold: " << kws_threshold 
+              << " | Decay: " << kws_decay 
+              << " | Window: " << kws_window_sec << "s\n";
+              
     load_guid(config_dir);
     
     WebSocketClient ws_client;
@@ -294,8 +312,6 @@ int main(int argc, char* argv[]) {
     
     ws_client.on_guid_assigned = [&](std::string new_guid) {
         std::cout << "\n[Auth] Received onboarding payload from Server!\n";
-        
-        // --- PASS DYNAMIC CONFIG PATH ---
         save_guid(config_dir, new_guid);
         
         std::lock_guard<std::mutex> lock(g_network_mtx);
@@ -304,14 +320,22 @@ int main(int argc, char* argv[]) {
 
     AudioRingBuffer pre_roll_buffer(SAMPLE_RATE * pre_roll_sec);
     TFLiteRunner wakeword_model(model_file);
-    WindowAverager jarvis_averager(30, threshold);
+    
+    // Dynamically size the circular buffer based on the window parameter
+    int averager_frames = static_cast<int>(kws_window_sec / (static_cast<float>(HOP_STEP) / SAMPLE_RATE));
+    WindowAverager jarvis_averager(averager_frames);
+
+    KWS_State current_kws_state = IDLE;
+    float current_peak = 0.0f;
+    float current_auc = 0.0f;
 
     ws_client.on_start_command = [&]() {
-        if (debug_mode) std::cout << "\n✅ [Server] Threshold won! You have the floor.\n";
+        if (debug_mode) std::cout << "\n✅ [Server] Won arbitration! Streaming audio...\n";
     };
 
     ws_client.on_stop_command = [&]() {
         g_current_state = LISTENING;
+        current_kws_state = IDLE;
         pre_roll_buffer.flush(); 
         wakeword_model.reset_states();
         jarvis_averager.reset();
@@ -375,28 +399,55 @@ int main(int argc, char* argv[]) {
         float raw_jarvis_prob = scores.empty() ? 0.0f : scores[0]; 
         float smoothed_jarvis_prob = 0.0f;
         
-        bool is_hit = jarvis_averager.process(raw_jarvis_prob, smoothed_jarvis_prob);
+        // Push raw into circular buffer, compute smoothed average
+        jarvis_averager.process(raw_jarvis_prob, smoothed_jarvis_prob);
 
-        if (debug_mode && g_current_state == LISTENING) {
+        if (debug_mode && g_current_state == LISTENING && current_kws_state == IDLE) {
             int bars = static_cast<int>(smoothed_jarvis_prob * 20.0f);
             std::cout << "\r[Gain: " << agc.get_current_gain() << "] [Env: " << std::string(std::min(bars, 20), '#') 
                       << std::string(20 - std::min(bars, 20), '-') << "] | Avg: " << smoothed_jarvis_prob << "   " << std::flush;
         }
 
-        if (is_hit) {
-            if (!g_authenticated) {
-                if (debug_mode) std::cout << "\n[!] Wake word hit, but device is not authenticated! Ignoring.\n";
-            } else {
-                if (debug_mode) std::cout << "\n🔔 WAKE WORD DETECTED! Bidding Threshold & Streaming...\n";
+        // --- NEW: The Control Logic & Scoring State Machine ---
+        if (current_kws_state == IDLE) {
+            if (smoothed_jarvis_prob >= kws_threshold) {
+                current_kws_state = ARMED;
+                current_peak = smoothed_jarvis_prob;
                 
-                std::lock_guard<std::mutex> lock(g_network_mtx);
-                ws_client.send_confidence(smoothed_jarvis_prob);
-                ws_client.send_audio(pre_roll_buffer.flush());
-                g_current_state = STREAMING; 
+                // Grab the raw sum of the onset from the circular buffer!
+                current_auc = jarvis_averager.get_current_sum(); 
+                
+                if (debug_mode) std::cout << "\n[KWS] Armed! Tracking peak and mass...\n";
+            }
+        } 
+        else if (current_kws_state == ARMED) {
+            // 1. Accumulate the raw energy
+            current_auc += raw_jarvis_prob;
+            
+            // 2. Track the peak of the smoothed control curve
+            if (smoothed_jarvis_prob > current_peak) {
+                current_peak = smoothed_jarvis_prob;
             }
             
-            wakeword_model.reset_states();
-            jarvis_averager.reset();
+            // 3. Stop Condition: Smoothed curve drops by the decay factor
+            if (smoothed_jarvis_prob <= (current_peak - kws_decay)) {
+                
+                if (!g_authenticated) {
+                    if (debug_mode) std::cout << "\n[!] Wake word hit, but device is unenrolled. Ignoring.\n";
+                } else {
+                    if (debug_mode) std::cout << "🔔 WAKE WORD COMPLETE! Peak: " << current_peak << " | AUC Score: " << current_auc << "\n";
+                    
+                    std::lock_guard<std::mutex> lock(g_network_mtx);
+                    ws_client.send_confidence(current_auc); // Win arbitration with the massive raw score!
+                    ws_client.send_audio(pre_roll_buffer.flush());
+                    g_current_state = STREAMING; 
+                }
+                
+                // Reset everything
+                current_kws_state = IDLE;
+                wakeword_model.reset_states();
+                jarvis_averager.reset();
+            }
         }
     }
 
