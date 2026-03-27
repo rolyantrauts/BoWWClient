@@ -20,13 +20,13 @@ Options:
 ```
 Still to create a BT mobile app as local BT is sceure by nature.
 
-On the server when 1st enrolling a client it gains a temp_id
-A mobile app will add that temp_id and guid_id to add that client to a group.
-Currently will have to be done by hand client_guid.txt containing.
+On the server when 1st enrolling a client it gains a temp_id  
+A mobile app will add that temp_id and guid_id to add that client to a group.  
+Currently will have to be done by hand client_guid.txt containing.  
 `871fb1f9-7ecf-426e-a5ce-a6ad67cfdd72`
 
-Server
-clients.yaml
+Server  
+clients.yaml  
 ```
 groups:
   - name: "bedroom"
@@ -43,10 +43,11 @@ clients:
     group: "bedroom"
     # Update this TempID to whatever the server prints in the log when you connect
 ```
+You can have multiple clients in a group so you can have multiple mics in a zone.  
+The mics that pick up a wakeword transmit the wakeword threshold and best threshold is chosen as best stream  
 
-
--d <device>    ALSA KWS Mono Input (default: plughw:Loopback,1,0)
-This is the 16khz 16bit mono audio stream for the KWS
--A <device>    ALSA Multi-Mic Array Input (Streaming Source)
-If not defined the -d <device> stream will be streamed to the server.
-If defined the wakeword will use -d <device> but stream the -A <device> 
+-d <device>    ALSA KWS Mono Input (default: plughw:Loopback,1,0)  
+This is the 16khz 16bit mono audio stream for the KWS  
+-A <device>    ALSA Multi-Mic Array Input (Streaming Source)  
+If not defined the -d <device> stream will be streamed to the server.  
+If defined the wakeword will use -d <device> but stream the -A <device>   
