@@ -1,95 +1,113 @@
 #include "WebSocketClient.h"
 #include <iostream>
 
-const std::string MSG_HELLO = "hello";
-const std::string MSG_ENROLL = "enroll";
-const std::string MSG_ASSIGN_TEMP_ID = "assign_temp_id";
-const std::string MSG_ASSIGN_ID = "assign_id";
-const std::string MSG_START = "start";
-const std::string MSG_STOP = "stop";
-const std::string MSG_CONF_REC = "conf_rec";
-
 WebSocketClient::WebSocketClient() {
-    c.clear_access_channels(websocketpp::log::alevel::all);
-    c.clear_error_channels(websocketpp::log::elevel::all);
-    c.init_asio();
+    client_.clear_access_channels(websocketpp::log::alevel::all);
+    client_.clear_error_channels(websocketpp::log::elevel::all);
+    client_.init_asio();
 
-    c.set_open_handler([this](websocketpp::connection_hdl h) {
-        hdl = h;
-        connected = true;
-        if (on_connected) on_connected();
-    });
+    using websocketpp::lib::placeholders::_1;
+    using websocketpp::lib::placeholders::_2;
+    client_.set_open_handler(bind(&WebSocketClient::on_open, this, _1));
+    client_.set_close_handler(bind(&WebSocketClient::on_close, this, _1));
+    client_.set_message_handler(bind(&WebSocketClient::on_message, this, _1, _2));
+}
 
-    c.set_close_handler([this](websocketpp::connection_hdl h) {
-        connected = false;
-        if (on_disconnected) on_disconnected();
-    });
-
-    c.set_message_handler([this](websocketpp::connection_hdl h, client::message_ptr msg) {
-        if (msg->get_opcode() == websocketpp::frame::opcode::text) {
-            try {
-                auto j = nlohmann::json::parse(msg->get_payload());
-                if (j.contains("type")) {
-                    std::string type = j["type"];
-                    
-                    if (type == MSG_ASSIGN_ID && j.contains("id")) {
-                        if (on_guid_assigned) on_guid_assigned(j["id"]);
-                    } 
-                    else if (type == MSG_ASSIGN_TEMP_ID && j.contains("id")) {
-                        if (on_temp_id_assigned) on_temp_id_assigned(j["id"]);
-                    } 
-                    else if (type == MSG_START) {
-                        if (on_start_command) on_start_command();
-                    } 
-                    else if (type == MSG_STOP) {
-                        if (on_stop_command) on_stop_command();
-                    }
-                }
-            } catch (...) {}
-        }
-    });
+WebSocketClient::~WebSocketClient() {
+    disconnect();
 }
 
 bool WebSocketClient::connect(const std::string& uri) {
     websocketpp::lib::error_code ec;
-    client::connection_ptr con = c.get_connection(uri, ec);
-    if (ec) return false;
-    
-    c.connect(con);
-    std::thread([this]() { c.run(); }).detach();
+    WsClient::connection_ptr con = client_.get_connection(uri, ec);
+    if (ec) {
+        std::cerr << "[WebSocket] Connect error: " << ec.message() << std::endl;
+        return false;
+    }
+    client_.connect(con);
+    ws_thread_ = std::thread([this]() { client_.run(); });
     return true;
 }
 
-void WebSocketClient::close() {
-    if (connected) {
+void WebSocketClient::disconnect() {
+    if (is_connected_) {
         websocketpp::lib::error_code ec;
-        c.close(hdl, websocketpp::close::status::normal, "", ec);
+        client_.close(hdl_, websocketpp::close::status::normal, "", ec);
+    }
+    client_.stop();
+    if (ws_thread_.joinable()) ws_thread_.join();
+}
+
+void WebSocketClient::on_open(websocketpp::connection_hdl hdl) {
+    // --- FIXED: Scope the lock so it releases BEFORE calling the callback ---
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        hdl_ = hdl;
+        is_connected_ = true;
+    }
+    
+    // Now it is safe to call user code without causing a deadlock!
+    if (on_connected) on_connected();
+}
+
+void WebSocketClient::on_close(websocketpp::connection_hdl hdl) {
+    // --- FIXED: Scope the lock here as well ---
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        is_connected_ = false;
+    }
+    
+    if (on_disconnected) on_disconnected();
+}
+
+void WebSocketClient::on_message(websocketpp::connection_hdl hdl, WsClient::message_ptr msg) {
+    if (msg->get_opcode() == websocketpp::frame::opcode::text) {
+        try {
+            auto j = nlohmann::json::parse(msg->get_payload());
+            if (!j.contains("type")) return;
+            std::string type = j["type"];
+
+            if (type == "assign_temp_id" && on_temp_id_assigned) {
+                on_temp_id_assigned(j["id"]);
+            } else if (type == "assign_id" && on_guid_assigned) {
+                on_guid_assigned(j["id"]);
+            } else if (type == "start" && on_start_command) {
+                on_start_command();
+            } else if (type == "stop" && on_stop_command) {
+                on_stop_command();
+            } 
+            else if (type == "hello_ack" && on_hello_ack) {
+                float preroll = j.value("preroll_seconds", 2.0f); 
+                on_hello_ack(preroll);
+            }
+        } catch (...) {}
     }
 }
 
-void WebSocketClient::send_text(const std::string& msg) {
-    if (!connected) return;
-    websocketpp::lib::error_code ec;
-    c.send(hdl, msg, websocketpp::frame::opcode::text, ec);
+void WebSocketClient::send_json(const nlohmann::json& j) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!is_connected_) return;
+    try {
+        client_.send(hdl_, j.dump(), websocketpp::frame::opcode::text);
+    } catch (...) {}
 }
 
 void WebSocketClient::send_hello(const std::string& guid) {
-    nlohmann::json j = { {"type", MSG_HELLO}, {"guid", guid} };
-    send_text(j.dump());
+    send_json({{"type", "hello"}, {"guid", guid}});
 }
 
 void WebSocketClient::send_enroll() {
-    nlohmann::json j = { {"type", MSG_ENROLL} };
-    send_text(j.dump());
+    send_json({{"type", "enroll"}});
 }
 
 void WebSocketClient::send_confidence(float score) {
-    nlohmann::json j = { {"type", MSG_CONF_REC} }; 
-    send_text(j.dump());
+    send_json({{"type", "confidence"}, {"score", score}});
 }
 
 void WebSocketClient::send_audio(const std::vector<int16_t>& pcm_data) {
-    if (!connected || pcm_data.empty()) return;
-    websocketpp::lib::error_code ec;
-    c.send(hdl, pcm_data.data(), pcm_data.size() * sizeof(int16_t), websocketpp::frame::opcode::binary, ec);
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!is_connected_ || pcm_data.empty()) return;
+    try {
+        client_.send(hdl_, pcm_data.data(), pcm_data.size() * sizeof(int16_t), websocketpp::frame::opcode::binary);
+    } catch (...) {}
 }

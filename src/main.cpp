@@ -41,7 +41,6 @@ void print_usage(const char* prog_name) {
               << "  -d <device>    ALSA KWS Mono Input (default: plughw:Loopback,1,0)\n"
               << "  -A <device>    ALSA Multi-Mic Array Input (Streaming Source)\n"
               << "  -s <uri>       Manual Server URI override (e.g., ws://192.168.1.50:9002)\n"
-              << "  -p <float>     Pre-roll buffer duration in seconds (default: 3.0)\n"
               << "  -m <filepath>  Path to trained .tflite model file\n"
               << "  -t <string>    KWS Params: Threshold,Decay,WindowSec (default: 0.75,0.1,0.6)\n"
               << "  -D             Enable Debug Mode (Live VU and logs)\n"
@@ -224,18 +223,14 @@ int main(int argc, char* argv[]) {
     std::string alsa_array_dev = "";
     std::string manual_uri = "";
     std::string model_file = "models/wakeword.tflite";
-    std::string file_input = "";
     
-    // --- Default KWS Params ---
     float kws_threshold = 0.75f;
     float kws_decay = 0.10f;
     float kws_window_sec = 0.60f;
-    
-    float pre_roll_sec = 3.0f;
     bool debug_mode = false;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:d:A:s:p:f:t:m:Dh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:d:A:s:t:m:Dh")) != -1) {
         switch (opt) {
             case 'c': 
                 config_dir = optarg; 
@@ -246,10 +241,7 @@ int main(int argc, char* argv[]) {
             case 'd': alsa_kws_dev = optarg; break;
             case 'A': alsa_array_dev = optarg; break;
             case 's': manual_uri = optarg; break;
-            case 'p': pre_roll_sec = std::stof(optarg); break;
-            case 'f': file_input = optarg; break;
             case 't': {
-                // Parse the "0.75,0.1,0.6" array
                 std::string arg(optarg);
                 std::stringstream ss(arg);
                 std::string token;
@@ -285,6 +277,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    // Create the buffer with a small 1-second default until the server tells us otherwise
+    AudioRingBuffer pre_roll_buffer(SAMPLE_RATE * 1.0f);
+    
     std::cout << "[Network] Connecting to " << ws_uri << "...\n";
     
     ws_client.on_connected = [&]() {
@@ -303,6 +298,11 @@ int main(int argc, char* argv[]) {
         g_running = false; 
     };
 
+    ws_client.on_hello_ack = [&](float preroll_seconds) {
+        std::cout << "[Network] Handshake complete. Syncing pre-roll buffer to " << preroll_seconds << "s.\n";
+        pre_roll_buffer.resize(static_cast<size_t>(SAMPLE_RATE * preroll_seconds));
+    };
+
     ws_client.on_temp_id_assigned = [&](std::string temp_id) {
         std::cout << "\n======================================================\n";
         std::cout << " [Auth] Server assigned Temp ID: " << temp_id << "\n";
@@ -318,10 +318,8 @@ int main(int argc, char* argv[]) {
         ws_client.send_hello(g_client_guid);
     };
 
-    AudioRingBuffer pre_roll_buffer(SAMPLE_RATE * pre_roll_sec);
     TFLiteRunner wakeword_model(model_file);
     
-    // Dynamically size the circular buffer based on the window parameter
     int averager_frames = static_cast<int>(kws_window_sec / (static_cast<float>(HOP_STEP) / SAMPLE_RATE));
     WindowAverager jarvis_averager(averager_frames);
 
@@ -352,8 +350,13 @@ int main(int argc, char* argv[]) {
         array_thread = std::thread(array_capture_loop, alsa_array_dev, SAMPLE_RATE, HOP_STEP, &pre_roll_buffer, &ws_client);
     }
 
+    // --- NEW: LOUD ERROR FOR ALSA MICROPHONE LOCKS ---
     snd_pcm_t* kws_mic = init_alsa_mono(alsa_kws_dev, SAMPLE_RATE, HOP_STEP);
-    if (!kws_mic) return 1;
+    if (!kws_mic) {
+        std::cerr << "\n[!] FATAL: Could not open ALSA microphone: " << alsa_kws_dev << "\n";
+        std::cerr << "[!] Is another instance running? Try: sudo killall -9 BoWWClient\n\n";
+        return 1;
+    }
     
     LookaheadAGC agc(5, 0.80f, 15.0f, 0.05f, 1.5f, SAMPLE_RATE);
     FeatureExtractor feature_extractor;
@@ -399,7 +402,6 @@ int main(int argc, char* argv[]) {
         float raw_jarvis_prob = scores.empty() ? 0.0f : scores[0]; 
         float smoothed_jarvis_prob = 0.0f;
         
-        // Push raw into circular buffer, compute smoothed average
         jarvis_averager.process(raw_jarvis_prob, smoothed_jarvis_prob);
 
         if (debug_mode && g_current_state == LISTENING && current_kws_state == IDLE) {
@@ -408,28 +410,22 @@ int main(int argc, char* argv[]) {
                       << std::string(20 - std::min(bars, 20), '-') << "] | Avg: " << smoothed_jarvis_prob << "   " << std::flush;
         }
 
-        // --- NEW: The Control Logic & Scoring State Machine ---
         if (current_kws_state == IDLE) {
             if (smoothed_jarvis_prob >= kws_threshold) {
                 current_kws_state = ARMED;
                 current_peak = smoothed_jarvis_prob;
-                
-                // Grab the raw sum of the onset from the circular buffer!
                 current_auc = jarvis_averager.get_current_sum(); 
                 
                 if (debug_mode) std::cout << "\n[KWS] Armed! Tracking peak and mass...\n";
             }
         } 
         else if (current_kws_state == ARMED) {
-            // 1. Accumulate the raw energy
             current_auc += raw_jarvis_prob;
             
-            // 2. Track the peak of the smoothed control curve
             if (smoothed_jarvis_prob > current_peak) {
                 current_peak = smoothed_jarvis_prob;
             }
             
-            // 3. Stop Condition: Smoothed curve drops by the decay factor
             if (smoothed_jarvis_prob <= (current_peak - kws_decay)) {
                 
                 if (!g_authenticated) {
@@ -438,12 +434,11 @@ int main(int argc, char* argv[]) {
                     if (debug_mode) std::cout << "🔔 WAKE WORD COMPLETE! Peak: " << current_peak << " | AUC Score: " << current_auc << "\n";
                     
                     std::lock_guard<std::mutex> lock(g_network_mtx);
-                    ws_client.send_confidence(current_auc); // Win arbitration with the massive raw score!
+                    ws_client.send_confidence(current_auc); 
                     ws_client.send_audio(pre_roll_buffer.flush());
                     g_current_state = STREAMING; 
                 }
                 
-                // Reset everything
                 current_kws_state = IDLE;
                 wakeword_model.reset_states();
                 jarvis_averager.reset();
