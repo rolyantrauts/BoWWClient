@@ -61,3 +61,41 @@ You can use as is, a 1uf film capacitor on the output with block dc noise, havin
 Short VCC & gain for 40 dB gain leave AR floating.  
 The CM108 board type USB soundcards are good, cheap and you know what your getting.  
 Multiple BoWWClient can connect in groups to BoWWServer to create coverage for a room and due to AUC alg best stream is chosen for ASR
+
+🎙️ Wake Word Envelope Tuning (Client-Side)
+The BoWW Edge Client runs a highly efficient INT8 quantized TFLite model for low-latency, continuous listening. To prevent false positives while maintaining zero-latency responsiveness, the client shapes the neural network's raw output into an acoustic envelope using ADSR (Attack, Decay, Sustain/Release) mathematics.
+
+You configure the envelope engine via the command line using the -t flag followed by a comma-separated string:
+-t <Type>,<Threshold>,<Attack>,<Hold>,<Decay>
+
+Parameters
+Type (char): The verification algorithm to use (l for Leading, a for Average).
+
+Threshold (float): The raw probability (0.0 to 1.0) the INT8 model must hit.
+
+Attack (int): The consecutive number of frames the raw probability must exceed the threshold to arm the wake word state machine.
+
+Hold (int): The size of the sliding window used to smooth the neural network output.
+
+Decay (float): The drop in probability required to close the gate, finalize the word, and send the audio stream to the server.
+
+Mode 1: Leading Edge (Relative Decay)
+Best for: Quiet to moderate rooms, close-up microphones, or environments where you want instant, zero-latency responsiveness.
+Logic: The client trusts the initial raw "Attack" completely. Once the gate opens, it dynamically tracks the highest point the smoothed average ever reaches. The gate closes (and the stream is sent to the server) the moment the average drops by your Decay amount relative to that peak. It closely hugs the shape of the word.
+
+Example Command:
+```
+./BoWWClient -d plughw:0,0 -m models/hey_jarvis_int8.tflite -t l,0.90,4,20,0.20
+```
+(Triggers instantly on 4 frames of 90% confidence. Uses a 20-frame smoothing window. Closes the gate when the average drops 20% from its highest peak).
+
+Mode 2: Average (Absolute Decay)
+Best for: Noisy environments (living rooms with a TV on) where transient background noise causes the INT8 model to spike unpredictably.
+Logic: The client hears the fast raw "Attack" but refuses to validate the wake word until the smoothed average also proves it has enough sustained acoustic energy to cross the threshold. Once validated, it waits for the average to drop below a fixed, absolute hard line (Threshold - Decay) before sending the stream to the server.
+
+Example Command:
+```
+./BoWWClient -d plughw:0,0 -m models/hey_jarvis_int8.tflite -t a,0.85,5,30,0.15
+```
+(Arms on 5 frames of 85% confidence, but demands the 30-frame running average also crosses 85%. Closes the gate only when the average drops strictly below 0.70).
+
