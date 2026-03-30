@@ -38,12 +38,13 @@ void print_usage(const char* prog_name) {
               << "Usage: " << prog_name << " [OPTIONS]\n\n"
               << "Options:\n"
               << "  -c <dir>       Path to config dir for client_guid.txt (default: ./)\n"
-              << "  -d <device>    ALSA KWS Mono Input (default: plughw:Loopback,1,0)\n"
+              << "  -D <device>    ALSA KWS Mono Input (default: plughw:Loopback,1,0)\n"
               << "  -A <device>    ALSA Multi-Mic Array Input (Streaming Source)\n"
               << "  -s <uri>       Manual Server URI override (e.g., ws://192.168.1.50:9002)\n"
               << "  -m <filepath>  Path to trained .tflite model file\n"
-              << "  -t <string>    KWS Params: Threshold,Decay,WindowSec (default: 0.75,0.1,0.6)\n"
-              << "  -D             Enable Debug Mode (Live VU and logs)\n"
+              << "  -t <string>    KWS Params: Type,Threshold,Attack,Hold,Decay (default: l,0.9,4,20,0.2)\n"
+              << "                 Types: 'l' (Leading), 'a' (Average)\n"
+              << "  -d             Enable Debug Mode (Live VU and logs)\n"
               << "  -h             Show this help message and exit\n\n";
 }
 
@@ -224,13 +225,17 @@ int main(int argc, char* argv[]) {
     std::string manual_uri = "";
     std::string model_file = "models/wakeword.tflite";
     
-    float kws_threshold = 0.75f;
-    float kws_decay = 0.10f;
-    float kws_window_sec = 0.60f;
+    // --- DEFAULT ADSR PARAMETERS ---
+    char kws_mode = 'l'; // 'l' = Leading, 'a' = Average
+    float kws_threshold = 0.90f;
+    int kws_attack = 4;
+    int kws_hold = 20;
+    float kws_decay = 0.20f;
     bool debug_mode = false;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:d:A:s:t:m:Dh")) != -1) {
+    // Note: Swapped 'd' and 'D' in the getopt string
+    while ((opt = getopt(argc, argv, "c:D:A:s:t:m:dh")) != -1) {
         switch (opt) {
             case 'c': 
                 config_dir = optarg; 
@@ -238,24 +243,50 @@ int main(int argc, char* argv[]) {
                     config_dir += "/";
                 }
                 break;
-            case 'd': alsa_kws_dev = optarg; break;
+            case 'D': alsa_kws_dev = optarg; break; // Swapped to -D for device
             case 'A': alsa_array_dev = optarg; break;
             case 's': manual_uri = optarg; break;
             case 't': {
                 std::string arg(optarg);
                 std::stringstream ss(arg);
                 std::string token;
-                if (std::getline(ss, token, ',')) kws_threshold = std::stof(token);
-                if (std::getline(ss, token, ',')) kws_decay = std::stof(token);
-                if (std::getline(ss, token, ',')) kws_window_sec = std::stof(token);
+                std::vector<std::string> tokens;
+                
+                // Split by comma
+                while (std::getline(ss, token, ',')) {
+                    tokens.push_back(token);
+                }
+                
+                if (!tokens.empty()) {
+                    int idx = 0;
+                    
+                    // Check if the user provided the explicit 'a' or 'l' mode prefix
+                    if (tokens[0] == "a" || tokens[0] == "l") {
+                        kws_mode = tokens[0][0];
+                        idx++;
+                    }
+                    
+                    // Safely parse the remaining float/int parameters
+                    try {
+                        if (idx < tokens.size()) kws_threshold = std::stof(tokens[idx++]);
+                        if (idx < tokens.size()) kws_attack = std::stoi(tokens[idx++]);
+                        if (idx < tokens.size()) kws_hold = std::stoi(tokens[idx++]);
+                        if (idx < tokens.size()) kws_decay = std::stof(tokens[idx++]);
+                    } catch (...) {
+                        std::cerr << "[!] Error parsing -t parameters. Using defaults.\n";
+                    }
+                }
                 break;
             }
             case 'm': model_file = optarg; break;
-            case 'D': debug_mode = true; break;
+            case 'd': debug_mode = true; break; // Swapped to -d for debug
             case 'h': print_usage(argv[0]); return 0;
             default: print_usage(argv[0]); return 1;
         }
     }
+
+    // --- Prevent Segfaults from bad user inputs ---
+    kws_hold = std::max(1, kws_hold); 
 
     const int SAMPLE_RATE = 16000;
     const int HOP_STEP = 320;          
@@ -263,9 +294,11 @@ int main(int argc, char* argv[]) {
     const int TF_MFCC_BINS = 20;       
 
     std::cout << "\n[OK] BoWWClient Edge Node Online.\n";
-    std::cout << "[KWS] Params -> Threshold: " << kws_threshold 
-              << " | Decay: " << kws_decay 
-              << " | Window: " << kws_window_sec << "s\n";
+    std::cout << "[KWS] Params -> Mode: " << (kws_mode == 'a' ? "Average" : "Leading")
+              << " | Threshold: " << kws_threshold 
+              << " | Attack: " << kws_attack << " frames"
+              << " | Hold: " << kws_hold << " frames"
+              << " | Decay: " << kws_decay << "\n";
               
     load_guid(config_dir);
     
@@ -277,7 +310,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Create the buffer with a small 1-second default until the server tells us otherwise
     AudioRingBuffer pre_roll_buffer(SAMPLE_RATE * 1.0f);
     
     std::cout << "[Network] Connecting to " << ws_uri << "...\n";
@@ -319,13 +351,18 @@ int main(int argc, char* argv[]) {
     };
 
     TFLiteRunner wakeword_model(model_file);
-    
-    int averager_frames = static_cast<int>(kws_window_sec / (static_cast<float>(HOP_STEP) / SAMPLE_RATE));
-    WindowAverager jarvis_averager(averager_frames);
+    WindowAverager jarvis_averager(kws_hold);
 
     KWS_State current_kws_state = IDLE;
-    float current_peak = 0.0f;
+    int attack_counter = 0;
+    
+    float smoothed_peak = 0.0f;
+    float raw_peak = 0.0f;
     float current_auc = 0.0f;
+    int current_frame_count = 0; 
+    
+    std::vector<float> attack_raw_history;
+    std::vector<float> attack_avg_history;
 
     ws_client.on_start_command = [&]() {
         if (debug_mode) std::cout << "\n✅ [Server] Won arbitration! Streaming audio...\n";
@@ -337,6 +374,8 @@ int main(int argc, char* argv[]) {
         pre_roll_buffer.flush(); 
         wakeword_model.reset_states();
         jarvis_averager.reset();
+        attack_counter = 0;
+        current_frame_count = 0; 
         if (debug_mode) std::cout << "\n[Server] Stop Command Rx'd. Returning to Listen.\n\n";
     };
 
@@ -350,7 +389,6 @@ int main(int argc, char* argv[]) {
         array_thread = std::thread(array_capture_loop, alsa_array_dev, SAMPLE_RATE, HOP_STEP, &pre_roll_buffer, &ws_client);
     }
 
-    // --- NEW: LOUD ERROR FOR ALSA MICROPHONE LOCKS ---
     snd_pcm_t* kws_mic = init_alsa_mono(alsa_kws_dev, SAMPLE_RATE, HOP_STEP);
     if (!kws_mic) {
         std::cerr << "\n[!] FATAL: Could not open ALSA microphone: " << alsa_kws_dev << "\n";
@@ -411,37 +449,100 @@ int main(int argc, char* argv[]) {
         }
 
         if (current_kws_state == IDLE) {
-            if (smoothed_jarvis_prob >= kws_threshold) {
-                current_kws_state = ARMED;
-                current_peak = smoothed_jarvis_prob;
-                current_auc = jarvis_averager.get_current_sum(); 
+            if (raw_jarvis_prob >= kws_threshold) {
+                if (attack_counter == 0) {
+                    current_auc = 0.0f;
+                    raw_peak = 0.0f;
+                    attack_raw_history.clear();
+                    attack_avg_history.clear();
+                }
                 
-                if (debug_mode) std::cout << "\n[KWS] Armed! Tracking peak and mass...\n";
+                attack_counter++;
+                current_auc += raw_jarvis_prob;
+                
+                attack_raw_history.push_back(raw_jarvis_prob);
+                attack_avg_history.push_back(smoothed_jarvis_prob);
+                
+                if (raw_jarvis_prob > raw_peak) raw_peak = raw_jarvis_prob;
+                
+                if (attack_counter >= kws_attack) {
+                    current_kws_state = ARMED;
+                    smoothed_peak = *std::max_element(attack_avg_history.begin(), attack_avg_history.end());
+                    current_frame_count = attack_counter; 
+                    
+                    if (debug_mode) {
+                        std::cout << "\n\n[KWS] Armed! (Fast Attack via RAW over " << kws_attack << " frames)\n";
+                        for (size_t i = 0; i < attack_raw_history.size(); ++i) {
+                            std::cout << "[RAW] " << attack_raw_history[i] << " | [AVG] " << attack_avg_history[i] << " (Attack Frame " << (i+1) << ")\n";
+                        }
+                    }
+                }
+            } else {
+                attack_counter = 0;
+                current_auc = 0.0f;
             }
         } 
         else if (current_kws_state == ARMED) {
             current_auc += raw_jarvis_prob;
+            current_frame_count++; 
             
-            if (smoothed_jarvis_prob > current_peak) {
-                current_peak = smoothed_jarvis_prob;
-            }
+            if (debug_mode) std::cout << "[RAW] " << raw_jarvis_prob << " | [AVG] " << smoothed_jarvis_prob << "\n";
             
-            if (smoothed_jarvis_prob <= (current_peak - kws_decay)) {
+            if (raw_jarvis_prob > raw_peak) raw_peak = raw_jarvis_prob;
+            if (smoothed_jarvis_prob > smoothed_peak) smoothed_peak = smoothed_jarvis_prob;
+            
+            // --- DUAL-MODE RELEASE LOGIC ---
+            bool should_release = false;
+            
+            if (kws_mode == 'l') {
+                // Leading Mode: Relative Decay from peak
+                float release_threshold = std::max(0.05f, smoothed_peak - kws_decay);
+                if (smoothed_jarvis_prob <= release_threshold) should_release = true;
                 
-                if (!g_authenticated) {
-                    if (debug_mode) std::cout << "\n[!] Wake word hit, but device is unenrolled. Ignoring.\n";
+            } else if (kws_mode == 'a') {
+                // Average Mode: Wait for the threshold, then absolute decay
+                if (smoothed_peak >= kws_threshold) {
+                    // Success Path: It crossed the threshold. Wait for it to fall back down.
+                    if (smoothed_jarvis_prob < (kws_threshold - kws_decay)) {
+                        should_release = true;
+                    }
                 } else {
-                    if (debug_mode) std::cout << "🔔 WAKE WORD COMPLETE! Peak: " << current_peak << " | AUC Score: " << current_auc << "\n";
-                    
-                    std::lock_guard<std::mutex> lock(g_network_mtx);
-                    ws_client.send_confidence(current_auc); 
-                    ws_client.send_audio(pre_roll_buffer.flush());
-                    g_current_state = STREAMING; 
+                    // Waiting Path: Give the buffer up to 'Hold' frames to reach the threshold
+                    if (current_frame_count >= kws_hold) {
+                        should_release = true; // Buffer filled, but never hit threshold. Abort.
+                    }
+                }
+            }
+
+            if (should_release) {
+                // --- VALIDATE EVENT ---
+                bool is_valid = false;
+                if (kws_mode == 'l') {
+                    is_valid = true; // Leading mode always accepts the initial fast attack
+                } else if (kws_mode == 'a' && smoothed_peak >= kws_threshold) {
+                    is_valid = true; // Average mode demands the running average crossed the threshold
+                }
+                
+                if (is_valid) {
+                    if (!g_authenticated) {
+                        if (debug_mode) std::cout << "\n[!] Wake word hit, but device is unenrolled. Ignoring.\n";
+                    } else {
+                        if (debug_mode) std::cout << "\n🔔 WAKE WORD COMPLETE! Raw Peak: " << raw_peak << " | Avg Peak: " << smoothed_peak << " | AUC Score: " << current_auc << " | Frames: " << current_frame_count << "\n\n";
+                        
+                        std::lock_guard<std::mutex> lock(g_network_mtx);
+                        ws_client.send_confidence(current_auc, current_frame_count); 
+                        ws_client.send_audio(pre_roll_buffer.flush());
+                        g_current_state = STREAMING; 
+                    }
+                } else {
+                    if (debug_mode) std::cout << "\n[KWS] Discarded: Average peak (" << smoothed_peak << ") never reached threshold (" << kws_threshold << ").\n\n";
                 }
                 
                 current_kws_state = IDLE;
+                attack_counter = 0;
                 wakeword_model.reset_states();
                 jarvis_averager.reset();
+                current_frame_count = 0; 
             }
         }
     }

@@ -39,24 +39,19 @@ void WebSocketClient::disconnect() {
 }
 
 void WebSocketClient::on_open(websocketpp::connection_hdl hdl) {
-    // --- FIXED: Scope the lock so it releases BEFORE calling the callback ---
     {
         std::lock_guard<std::mutex> lock(mtx_);
         hdl_ = hdl;
         is_connected_ = true;
     }
-    
-    // Now it is safe to call user code without causing a deadlock!
     if (on_connected) on_connected();
 }
 
 void WebSocketClient::on_close(websocketpp::connection_hdl hdl) {
-    // --- FIXED: Scope the lock here as well ---
     {
         std::lock_guard<std::mutex> lock(mtx_);
         is_connected_ = false;
     }
-    
     if (on_disconnected) on_disconnected();
 }
 
@@ -100,8 +95,9 @@ void WebSocketClient::send_enroll() {
     send_json({{"type", "enroll"}});
 }
 
-void WebSocketClient::send_confidence(float score) {
-    send_json({{"type", "confidence"}, {"score", score}});
+// <--- UPDATED: Included frame_count in the payload
+void WebSocketClient::send_confidence(float score, int frame_count) {
+    send_json({{"type", "confidence"}, {"score", score}, {"frame_count", frame_count}});
 }
 
 void WebSocketClient::send_audio(const std::vector<int16_t>& pcm_data) {
