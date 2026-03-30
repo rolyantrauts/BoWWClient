@@ -20,7 +20,7 @@ public:
 
     void send_hello(const std::string& guid);
     void send_enroll();
-    void send_confidence(float score);
+    void send_confidence(float score, int frame_count); // <--- UPDATED
     void send_audio(const std::vector<int16_t>& pcm_data);
 
     std::function<void()> on_connected;
@@ -30,7 +30,6 @@ public:
     std::function<void()> on_start_command;
     std::function<void()> on_stop_command;
     
-    // --- NEW: Handshake Callback ---
     std::function<void(float)> on_hello_ack; 
 
 private:
