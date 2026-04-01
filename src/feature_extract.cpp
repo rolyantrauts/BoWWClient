@@ -69,7 +69,8 @@ void FeatureExtractor::compute_mfcc_features(const std::vector<float>& raw_frame
             dot_product += mag_sq[k] * tf_mel_matrix[k][m];
         }
         // TensorFlow uses log (natural log) for MFCCs, not log10
-        log_mel[m] = std::log(dot_product + 1e-6f);
+        // log_mel[m] = std::log(dot_product + 1e-6f);
+        log_mel[m] = std::log(dot_product + 1e-12f);
     }
 
     // 6. Apply DCT to get MFCCs
